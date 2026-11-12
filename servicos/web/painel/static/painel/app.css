@@ -1,0 +1,29 @@
+[hidden] { display: none !important; }
+:root { --borda: #d0d5dd; --azul: #1d4ed8; --verde: #15803d; --vermelho: #b91c1c; --fundo: #f6f7f9; }
+* { box-sizing: border-box; }
+body { margin: 0; font: 16px/1.5 system-ui, sans-serif; background: var(--fundo); color: #1f2937; }
+header { display: flex; justify-content: space-between; align-items: center; padding: 12px 24px; background: #fff; border-bottom: 1px solid var(--borda); }
+h1 { font-size: 20px; margin: 0; }
+h2 { font-size: 17px; margin: 0 0 12px; }
+main { max-width: 860px; margin: 24px auto; padding: 0 16px; display: grid; gap: 16px; }
+.cartao { background: #fff; border: 1px solid var(--borda); border-radius: 10px; padding: 16px; }
+.duas-colunas { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 640px) { .duas-colunas { grid-template-columns: 1fr; } }
+label { display: block; margin-bottom: 10px; font-size: 14px; }
+input, select { display: block; width: 100%; padding: 8px; border: 1px solid var(--borda); border-radius: 6px; font: inherit; }
+.linha { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 12px; }
+button { padding: 8px 16px; border: 0; border-radius: 6px; background: var(--azul); color: #fff; font: inherit; cursor: pointer; }
+button:disabled { background: #9ca3af; cursor: not-allowed; }
+button.sec { background: #fff; color: #374151; border: 1px solid var(--borda); }
+.nota { color: #6b7280; font-size: 14px; margin: 8px 0; }
+.grade { display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); gap: 6px; margin-bottom: 8px; }
+.grade button { background: #fff; color: #1f2937; border: 1px solid var(--borda); padding: 8px 0; }
+.grade button.ocupado { background: #fee2e2; color: var(--vermelho); border-color: #fecaca; cursor: not-allowed; }
+.grade button.escolhido { background: var(--azul); color: #fff; border-color: var(--azul); }
+.grade button.conflito { background: var(--vermelho); color: #fff; border-color: var(--vermelho); }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--borda); }
+#mensagem { padding: 10px 14px; border-radius: 8px; margin: 0; }
+#mensagem.ok { background: #dcfce7; color: var(--verde); }
+#mensagem.erro { background: #fee2e2; color: var(--vermelho); }
+footer { text-align: center; color: #6b7280; font: 13px ui-monospace, monospace; padding: 24px 16px; }

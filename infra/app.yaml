@@ -1,0 +1,705 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  reserva-app - execucao: cluster ECS (Fargate), ALB com regras por caminho, 4 target groups,
+  6 task definitions (5 servicos + a tarefa pontual de migracao) e 5 services. Descartavel:
+  e recriada, escalada e apagada a cada ciclo. Os dados ficam em reserva-dados e as imagens
+  em reserva-ecr.
+
+Metadata:
+  cfn-lint:
+    config:
+      ignore_checks: [W1011]
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Rede e stacks}
+        Parameters: [VpcId, Subnets, StackDados, Prefixo, NomeRole]
+      - Label: {default: Imagens (uma tag por servico)}
+        Parameters: [TagWeb, TagUsuarios, TagRecursos, TagReservas, TagNotificacoes, TagMigracao]
+      - Label: {default: Escala e tamanho}
+        Parameters: [TaskSize, QtdPadrao, QtdReservas, QtdNotificacoes]
+      - Label: {default: Segredos}
+        Parameters: [JwtSecret, DbSenha]
+      - Label: {default: Regras de negocio (viram variaveis de ambiente de reservas)}
+        Parameters: [DuracaoMaxHoras, HoraAbertura, HoraFechamento, DiasAntecedenciaMax, FaculdadeTz]
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  Subnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Pelo menos duas subnets em zonas diferentes (o ALB exige). Mesma VPC do banco.
+  StackDados:
+    Type: String
+    Default: reserva-dados
+    Description: Nome da stack de dados (de onde vem o banco e a fila, por Fn::ImportValue).
+  Prefixo:
+    Type: String
+    Default: reserva
+    AllowedPattern: "^[a-z0-9][a-z0-9-]*$"
+    Description: Prefixo dos repositorios do ECR e nome do cluster.
+  NomeRole:
+    Type: String
+    Default: LabRole
+    Description: Role de execucao e de task. No Learner Lab nao e possivel criar roles; use a LabRole.
+
+  TagWeb:
+    Type: String
+    Default: v1
+  TagUsuarios:
+    Type: String
+    Default: v1
+  TagRecursos:
+    Type: String
+    Default: v1
+  TagReservas:
+    Type: String
+    Default: v1
+    Description: Trocar v1 por v2 dispara o rolling deployment; uma v3 quebrada dispara o circuit breaker.
+  TagNotificacoes:
+    Type: String
+    Default: v1
+  TagMigracao:
+    Type: String
+    Default: v1
+
+  TaskSize:
+    Type: String
+    Default: small
+    AllowedValues: [small, medium, large]
+    Description: Combinacoes validas de CPU e memoria do Fargate (ver Mappings).
+  QtdPadrao:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 10
+    Description: Quantidade de tasks de web, usuarios e recursos.
+  QtdReservas:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 10
+    Description: Quantidade de tasks de reservas (separada das demais, para escalar so ele na demonstracao).
+  QtdNotificacoes:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 5
+
+  JwtSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: Segredo do token JWT, o mesmo em usuarios, recursos e reservas. Aparece na task definition (limitacao do laboratorio).
+  DbSenha:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: A MESMA senha informada em reserva-dados (master e usuarios de servico).
+
+  DuracaoMaxHoras:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 12
+  HoraAbertura:
+    Type: Number
+    Default: 7
+    MinValue: 0
+    MaxValue: 23
+  HoraFechamento:
+    Type: Number
+    Default: 22
+    MinValue: 1
+    MaxValue: 23
+  DiasAntecedenciaMax:
+    Type: Number
+    Default: 14
+    MinValue: 1
+  FaculdadeTz:
+    Type: String
+    Default: America/Fortaleza
+
+Mappings:
+  # Fargate so aceita certas combinacoes de CPU (em unidades) e memoria (em MiB).
+  TaskSize:
+    small:
+      Cpu: "256"
+      Memoria: "512"
+    medium:
+      Cpu: "512"
+      Memoria: "1024"
+    large:
+      Cpu: "1024"
+      Memoria: "2048"
+
+Resources:
+  LogGrupo:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${Prefixo}"
+      RetentionInDays: 7
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref Prefixo
+
+  # ---------- rede ----------
+  AlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB das reservas - HTTP aberto para a internet
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  # As tasks so aceitam o ALB nas portas dos servicos.
+  ServicosSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Tasks dos servicos - entrada so a partir do ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3001
+          ToPort: 3003
+          SourceSecurityGroupId: !Ref AlbSG
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref AlbSG
+
+  # O worker nao aceita entrada nenhuma (so faz chamadas de saida ao SQS).
+  WorkerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Worker de notificacoes - sem entrada
+      VpcId: !Ref VpcId
+
+  # A regra de entrada do banco mora AQUI (e nao em reserva-dados): se ficasse la, as duas
+  # stacks dependeriam uma da outra e nenhuma poderia ser criada.
+  BancoIngresso:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: PostgreSQL a partir das tasks dos servicos
+      GroupId: !ImportValue
+        Fn::Sub: "${StackDados}-BancoSecurityGroup"
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref ServicosSG
+
+  # ---------- ALB ----------
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets: !Ref Subnets
+      SecurityGroups: [!Ref AlbSG]
+
+  TgWeb:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      VpcId: !Ref VpcId
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "15"      # menos espera ao trocar tasks: o rolling deployment da demo fica mais curto
+
+  TgUsuarios:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      TargetType: ip
+      Protocol: HTTP
+      Port: 3001
+      VpcId: !Ref VpcId
+      HealthCheckPath: /api/usuarios/health
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "15"      # menos espera ao trocar tasks: o rolling deployment da demo fica mais curto
+
+  TgRecursos:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      TargetType: ip
+      Protocol: HTTP
+      Port: 3002
+      VpcId: !Ref VpcId
+      HealthCheckPath: /api/recursos/health
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "15"      # menos espera ao trocar tasks: o rolling deployment da demo fica mais curto
+
+  TgReservas:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      TargetType: ip
+      Protocol: HTTP
+      Port: 3003
+      VpcId: !Ref VpcId
+      HealthCheckPath: /api/reservas/health
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "15"      # menos espera ao trocar tasks: o rolling deployment da demo fica mais curto
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TgWeb
+
+  RegraUsuarios:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values: [/api/usuarios, /api/usuarios/*]   # o padrao com /* nao casa /api/usuarios sem a barra final
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TgUsuarios
+
+  RegraRecursos:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: 20
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values: [/api/recursos, /api/recursos/*]   # o padrao com /* nao casa /api/recursos sem a barra final
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TgRecursos
+
+  RegraReservas:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: 30
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values: [/api/reservas, /api/reservas/*]   # o padrao com /* nao casa /api/reservas sem a barra final
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TgReservas
+
+  # ---------- task definitions ----------
+  TdWeb:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${Prefixo}-web"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: !FindInMap [TaskSize, !Ref TaskSize, Cpu]
+      Memory: !FindInMap [TaskSize, !Ref TaskSize, Memoria]
+      ExecutionRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/${NomeRole}"
+      TaskRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/${NomeRole}"
+      ContainerDefinitions:
+        - Name: web
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Prefixo}-web:${TagWeb}"
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          Environment:
+            - Name: PORT
+              Value: "8080"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGrupo
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: web
+
+  TdUsuarios:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${Prefixo}-usuarios"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: !FindInMap [TaskSize, !Ref TaskSize, Cpu]
+      Memory: !FindInMap [TaskSize, !Ref TaskSize, Memoria]
+      ExecutionRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/${NomeRole}"
+      TaskRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/${NomeRole}"
+      ContainerDefinitions:
+        - Name: usuarios
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Prefixo}-usuarios:${TagUsuarios}"
+          Essential: true
+          PortMappings:
+            - ContainerPort: 3001
+              Protocol: tcp
+          Environment:
+            - Name: DB_HOST
+              Value: !ImportValue
+                Fn::Sub: "${StackDados}-BancoEndpoint"
+            - Name: DB_PORT
+              Value: !ImportValue
+                Fn::Sub: "${StackDados}-BancoPorta"
+            - Name: DB_NAME
+              Value: !ImportValue
+                Fn::Sub: "${StackDados}-BancoNome"
+            - Name: DB_USER
+              Value: app_usuarios
+            - Name: DB_SENHA
+              Value: !Ref DbSenha
+            - Name: DB_SSLMODE
+              Value: require
+            - Name: JWT_SEGREDO
+              Value: !Ref JwtSecret
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGrupo
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: usuarios
+
+  TdRecursos:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${Prefixo}-recursos"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: !FindInMap [TaskSize, !Ref TaskSize, Cpu]
+      Memory: !FindInMap [TaskSize, !Ref TaskSize, Memoria]
+      ExecutionRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/${NomeRole}"
+      TaskRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/${NomeRole}"
+      ContainerDefinitions:
+        - Name: recursos
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Prefixo}-recursos:${TagRecursos}"
+          Essential: true
+          PortMappings:
+            - ContainerPort: 3002
+              Protocol: tcp
+          Environment:
+            - Name: DB_HOST
+              Value: !ImportValue
+                Fn::Sub: "${StackDados}-BancoEndpoint"
+            - Name: DB_PORT
+              Value: !ImportValue
+                Fn::Sub: "${StackDados}-BancoPorta"
+            - Name: DB_NAME
+              Value: !ImportValue
+                Fn::Sub: "${StackDados}-BancoNome"
+            - Name: DB_USER
+              Value: app_recursos
+            - Name: DB_SENHA
+              Value: !Ref DbSenha
+            - Name: DB_SSLMODE
+              Value: require
+            - Name: JWT_SEGREDO
+              Value: !Ref JwtSecret
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGrupo
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: recursos
+
+  TdReservas:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${Prefixo}-reservas"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: !FindInMap [TaskSize, !Ref TaskSize, Cpu]
+      Memory: !FindInMap [TaskSize, !Ref TaskSize, Memoria]
+      ExecutionRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/${NomeRole}"
+      TaskRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/${NomeRole}"
+      ContainerDefinitions:
+        - Name: reservas
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Prefixo}-reservas:${TagReservas}"
+          Essential: true
+          PortMappings:
+            - ContainerPort: 3003
+              Protocol: tcp
+          Environment:
+            - Name: DB_HOST
+              Value: !ImportValue
+                Fn::Sub: "${StackDados}-BancoEndpoint"
+            - Name: DB_PORT
+              Value: !ImportValue
+                Fn::Sub: "${StackDados}-BancoPorta"
+            - Name: DB_NAME
+              Value: !ImportValue
+                Fn::Sub: "${StackDados}-BancoNome"
+            - Name: DB_USER
+              Value: app_reservas
+            - Name: DB_SENHA
+              Value: !Ref DbSenha
+            - Name: DB_SSLMODE
+              Value: require
+            - Name: JWT_SEGREDO
+              Value: !Ref JwtSecret
+            - Name: RECURSOS_URL
+              Value: !Sub "http://${Alb.DNSName}"
+            - Name: SQS_URL
+              Value: !ImportValue
+                Fn::Sub: "${StackDados}-FilaUrl"
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: DURACAO_MAX_HORAS
+              Value: !Ref DuracaoMaxHoras
+            - Name: HORA_ABERTURA
+              Value: !Ref HoraAbertura
+            - Name: HORA_FECHAMENTO
+              Value: !Ref HoraFechamento
+            - Name: DIAS_ANTECEDENCIA_MAX
+              Value: !Ref DiasAntecedenciaMax
+            - Name: FACULDADE_TZ
+              Value: !Ref FaculdadeTz
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGrupo
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: reservas
+
+  TdNotificacoes:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${Prefixo}-notificacoes"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: !FindInMap [TaskSize, !Ref TaskSize, Cpu]
+      Memory: !FindInMap [TaskSize, !Ref TaskSize, Memoria]
+      ExecutionRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/${NomeRole}"
+      TaskRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/${NomeRole}"
+      ContainerDefinitions:
+        - Name: notificacoes
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Prefixo}-notificacoes:${TagNotificacoes}"
+          Essential: true
+          Environment:
+            - Name: SQS_URL
+              Value: !ImportValue
+                Fn::Sub: "${StackDados}-FilaUrl"
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGrupo
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: notificacoes
+
+  # Tarefa pontual (run-task, scripts/migrar.sh): cria extensao, esquemas e usuarios do banco. Nao e um service.
+  TdMigracao:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${Prefixo}-migracao"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: !FindInMap [TaskSize, !Ref TaskSize, Cpu]
+      Memory: !FindInMap [TaskSize, !Ref TaskSize, Memoria]
+      ExecutionRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/${NomeRole}"
+      TaskRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/${NomeRole}"
+      ContainerDefinitions:
+        - Name: migracao
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Prefixo}-migracao:${TagMigracao}"
+          Essential: true
+          Environment:
+            - Name: PGHOST
+              Value: !ImportValue
+                Fn::Sub: "${StackDados}-BancoEndpoint"
+            - Name: PGPORT
+              Value: !ImportValue
+                Fn::Sub: "${StackDados}-BancoPorta"
+            - Name: PGDATABASE
+              Value: !ImportValue
+                Fn::Sub: "${StackDados}-BancoNome"
+            - Name: PGUSER
+              Value: !ImportValue
+                Fn::Sub: "${StackDados}-BancoUsuarioMaster"
+            - Name: PGPASSWORD
+              Value: !Ref DbSenha
+            - Name: PGSSLMODE
+              Value: require
+            - Name: DB_SENHA
+              Value: !Ref DbSenha
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGrupo
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: migracao
+
+  # ---------- services ----------
+  SvcWeb:
+    Type: AWS::ECS::Service
+    DependsOn: [Listener]
+    Properties:
+      ServiceName: web
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TdWeb
+      LaunchType: FARGATE
+      DesiredCount: !Ref QtdPadrao
+      HealthCheckGracePeriodSeconds: 30
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100     # rolling: sobe as novas antes de derrubar as antigas
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true                 # deploy que nao estabiliza volta sozinho para a revisao anterior
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED      # no Learner Lab as subnets sao publicas; precisa para falar com o ECR
+          Subnets: !Ref Subnets
+          SecurityGroups: [!Ref ServicosSG]
+      LoadBalancers:
+        - ContainerName: web
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TgWeb
+
+  SvcUsuarios:
+    Type: AWS::ECS::Service
+    DependsOn: [Listener, RegraUsuarios]
+    Properties:
+      ServiceName: usuarios
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TdUsuarios
+      LaunchType: FARGATE
+      DesiredCount: !Ref QtdPadrao
+      HealthCheckGracePeriodSeconds: 30
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100     # rolling: sobe as novas antes de derrubar as antigas
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true                 # deploy que nao estabiliza volta sozinho para a revisao anterior
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED      # no Learner Lab as subnets sao publicas; precisa para falar com o ECR
+          Subnets: !Ref Subnets
+          SecurityGroups: [!Ref ServicosSG]
+      LoadBalancers:
+        - ContainerName: usuarios
+          ContainerPort: 3001
+          TargetGroupArn: !Ref TgUsuarios
+
+  SvcRecursos:
+    Type: AWS::ECS::Service
+    DependsOn: [Listener, RegraRecursos]
+    Properties:
+      ServiceName: recursos
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TdRecursos
+      LaunchType: FARGATE
+      DesiredCount: !Ref QtdPadrao
+      HealthCheckGracePeriodSeconds: 30
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100     # rolling: sobe as novas antes de derrubar as antigas
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true                 # deploy que nao estabiliza volta sozinho para a revisao anterior
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED      # no Learner Lab as subnets sao publicas; precisa para falar com o ECR
+          Subnets: !Ref Subnets
+          SecurityGroups: [!Ref ServicosSG]
+      LoadBalancers:
+        - ContainerName: recursos
+          ContainerPort: 3002
+          TargetGroupArn: !Ref TgRecursos
+
+  SvcReservas:
+    Type: AWS::ECS::Service
+    DependsOn: [Listener, RegraReservas]
+    Properties:
+      ServiceName: reservas
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TdReservas
+      LaunchType: FARGATE
+      DesiredCount: !Ref QtdReservas
+      HealthCheckGracePeriodSeconds: 30
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100     # rolling: sobe as novas antes de derrubar as antigas
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true                 # deploy que nao estabiliza volta sozinho para a revisao anterior
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED      # no Learner Lab as subnets sao publicas; precisa para falar com o ECR
+          Subnets: !Ref Subnets
+          SecurityGroups: [!Ref ServicosSG]
+      LoadBalancers:
+        - ContainerName: reservas
+          ContainerPort: 3003
+          TargetGroupArn: !Ref TgReservas
+
+  SvcNotificacoes:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: notificacoes
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TdNotificacoes
+      LaunchType: FARGATE
+      DesiredCount: !Ref QtdNotificacoes
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref Subnets
+          SecurityGroups: [!Ref WorkerSG]
+
+Outputs:
+  AlbUrl:
+    Description: Endereco do sistema (e a RECURSOS_URL usada por reservas)
+    Value: !Sub "http://${Alb.DNSName}"
+
+  Cluster:
+    Value: !Ref Cluster
+
+  ServicosSecurityGroup:
+    Description: Security group das tasks (scripts/migrar.sh usa nas tarefas pontuais)
+    Value: !Ref ServicosSG
+
+  SubnetsCsv:
+    Value: !Join [",", !Ref Subnets]
+
+  LogGrupoNome:
+    Value: !Ref LogGrupo

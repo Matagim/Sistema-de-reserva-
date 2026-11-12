@@ -1,0 +1,151 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  reserva-dados - banco de dados (RDS PostgreSQL) e fila de eventos (SQS com DLQ).
+  Guarda estado: demora a criar (o RDS leva varios minutos), entao sobe horas antes da
+  demonstracao e so e recriada quando se quer zerar os dados. A regra de entrada do banco
+  (porta 5432) fica em reserva-app, para as duas stacks nao dependerem uma da outra.
+
+Metadata:
+  cfn-lint:
+    config:
+      ignore_checks: [W1011]
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC onde o banco fica (use a VPC padrao do Learner Lab).
+
+  Subnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Pelo menos duas subnets em zonas diferentes (exigencia do subnet group do RDS, mesmo com uma so instancia).
+
+  DbSenha:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 64
+    AllowedPattern: "^[A-Za-z0-9_.!#$%^&*()+=-]+$"
+    ConstraintDescription: 8 a 64 caracteres; letras, numeros e _ . ! # $ % ^ & * ( ) + = - (o RDS proibe / @ aspas e espaco).
+    Description: Senha do usuario master. A tarefa de migracao a repassa aos usuarios de servico, que compartilham essa senha no laboratorio.
+
+  DbUsuarioMaster:
+    Type: String
+    Default: master
+    AllowedPattern: "^[a-z][a-z0-9_]{0,15}$"
+    Description: Usuario master do banco (so a tarefa de migracao usa).
+
+  DbNome:
+    Type: String
+    Default: faculdade
+    AllowedPattern: "^[a-z][a-z0-9_]{0,62}$"
+
+  DbClasse:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t3.medium, db.t4g.micro, db.t4g.small]
+    Description: O Learner Lab limita as classes de instancia; se a criacao for recusada, teste outra da lista.
+
+  DbArmazenamentoGb:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 100
+
+  VersaoPostgres:
+    Type: String
+    Default: "16"
+    Description: Versao do PostgreSQL. Se o RDS recusar a versao principal sozinha, informe uma versao completa (aws rds describe-db-engine-versions --engine postgres).
+
+Resources:
+  BancoSubnets:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnets do banco de reservas
+      SubnetIds: !Ref Subnets
+
+  # Sem regras de entrada aqui: reserva-app libera a porta 5432 para o security group dos servicos.
+  BancoSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Banco de reservas - a entrada 5432 e criada pela stack reserva-app
+      VpcId: !Ref VpcId
+
+  Banco:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete          # o padrao do RDS seria tirar um snapshot final
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: postgres
+      EngineVersion: !Ref VersaoPostgres
+      DBInstanceClass: !Ref DbClasse
+      AllocatedStorage: !Ref DbArmazenamentoGb
+      StorageType: gp2
+      DBName: !Ref DbNome
+      MasterUsername: !Ref DbUsuarioMaster
+      MasterUserPassword: !Ref DbSenha
+      DBSubnetGroupName: !Ref BancoSubnets
+      VPCSecurityGroups: [!Ref BancoSG]
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 0        # sem backup automatico: laboratorio (e a criacao fica mais rapida)
+      DeleteAutomatedBackups: true
+      DeletionProtection: false
+      AutoMinorVersionUpgrade: false
+
+  FilaDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: reservas-eventos-dlq
+      MessageRetentionPeriod: 1209600   # 14 dias, para dar tempo de investigar
+
+  Fila:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: reservas-eventos
+      VisibilityTimeout: 30
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt FilaDlq.Arn
+        maxReceiveCount: 3              # 3 falhas e a mensagem vai para a DLQ
+
+Outputs:
+  BancoEndpoint:
+    Description: Endereco do banco (DB_HOST das tasks)
+    Value: !GetAtt Banco.Endpoint.Address
+    Export:
+      Name: !Sub "${AWS::StackName}-BancoEndpoint"
+
+  BancoPorta:
+    Value: !GetAtt Banco.Endpoint.Port
+    Export:
+      Name: !Sub "${AWS::StackName}-BancoPorta"
+
+  BancoNome:
+    Value: !Ref DbNome
+    Export:
+      Name: !Sub "${AWS::StackName}-BancoNome"
+
+  BancoUsuarioMaster:
+    Value: !Ref DbUsuarioMaster
+    Export:
+      Name: !Sub "${AWS::StackName}-BancoUsuarioMaster"
+
+  BancoSecurityGroup:
+    Description: Security group do banco; reserva-app cria nele a regra de entrada da porta 5432
+    Value: !GetAtt BancoSG.GroupId
+    Export:
+      Name: !Sub "${AWS::StackName}-BancoSecurityGroup"
+
+  FilaUrl:
+    Value: !Ref Fila
+    Export:
+      Name: !Sub "${AWS::StackName}-FilaUrl"
+
+  FilaArn:
+    Value: !GetAtt Fila.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-FilaArn"
+
+  FilaDlqUrl:
+    Value: !Ref FilaDlq
+    Export:
+      Name: !Sub "${AWS::StackName}-FilaDlqUrl"

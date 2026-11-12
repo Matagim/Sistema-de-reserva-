@@ -1,0 +1,93 @@
+
+
+#   cp .env.example .env
+#   docker compose up --build
+
+
+name: reservas-faculdade
+
+x-servico-django: &servico-django
+  restart: unless-stopped
+  environment: &env-comum
+    DB_HOST: db
+    DB_NAME: faculdade
+    DB_SENHA: ${DB_SENHA:-dev12345}
+    JWT_SEGREDO: ${JWT_SEGREDO:-dev-segredo-trocar}
+    SEED_SENHA: ${SEED_SENHA:-demo12345}
+  depends_on:
+    bootstrap:
+      condition: service_completed_successfully
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: master
+      POSTGRES_PASSWORD: ${DB_MASTER_SENHA:-master123}
+      POSTGRES_DB: faculdade
+    ports: ["5432:5432"]
+    volumes: [dbdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U master -d faculdade"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+
+  bootstrap:
+    build: ./infra/bootstrap
+    environment:
+      PGHOST: db
+      PGUSER: master
+      PGPASSWORD: ${DB_MASTER_SENHA:-master123}
+      PGDATABASE: faculdade
+      DB_SENHA: ${DB_SENHA:-dev12345}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  usuarios:
+    <<: *servico-django
+    build: ./servicos/usuarios
+    environment:
+      <<: *env-comum
+      DB_USER: app_usuarios
+    command: >
+      sh -c "python manage.py migrate --noinput && python manage.py seed &&
+             exec gunicorn config.wsgi:application --bind 0.0.0.0:$${PORT} --access-logfile -"
+
+  recursos:
+    <<: *servico-django
+    build: ./servicos/recursos
+    environment:
+      <<: *env-comum
+      DB_USER: app_recursos
+    command: >
+      sh -c "python manage.py migrate --noinput && python manage.py seed &&
+             exec gunicorn config.wsgi:application --bind 0.0.0.0:$${PORT} --access-logfile -"
+
+  reservas:
+    <<: *servico-django
+    build: ./servicos/reservas
+    environment:
+      <<: *env-comum
+      DB_USER: app_reservas
+      RECURSOS_URL: http://recursos:3002   # na AWS: a URL do ALB
+      SQS_URL: ""                          # a fila só existe na AWS; vazio = evento só vai para o log
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             exec gunicorn config.wsgi:application --bind 0.0.0.0:$${PORT} --access-logfile -"
+
+  web:
+    build: ./servicos/web
+    restart: unless-stopped
+
+  alb:
+    image: nginx:1.27-alpine
+    ports: ["8000:80"]
+    volumes: ["./infra/local/nginx.conf:/etc/nginx/conf.d/default.conf:ro"]
+    depends_on: [web, usuarios, recursos, reservas]
+
+volumes:
+  dbdata:

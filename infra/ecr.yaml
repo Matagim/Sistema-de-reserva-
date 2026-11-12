@@ -1,0 +1,101 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  reserva-ecr - repositorios de imagens (um por servico, mais o da tarefa de migracao).
+  Sobrevive entre demonstracoes: so e apagada no fim do projeto (EmptyOnDelete apaga as imagens junto).
+
+Parameters:
+  Prefixo:
+    Type: String
+    Default: reserva
+    Description: Prefixo dos repositorios (gera reserva-web, reserva-usuarios, ...). scripts/build-push.sh usa o mesmo valor.
+    AllowedPattern: "^[a-z0-9][a-z0-9-]*$"
+
+  MaximoDeImagens:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    Description: Quantas imagens cada repositorio guarda (a lifecycle policy expira as mais antigas).
+
+Resources:
+  RepoWeb:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${Prefixo}-web"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {"rules":[{"rulePriority":1,"description":"manter as ${MaximoDeImagens} imagens mais recentes","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":${MaximoDeImagens}},"action":{"type":"expire"}}]}
+
+  RepoUsuarios:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${Prefixo}-usuarios"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {"rules":[{"rulePriority":1,"description":"manter as ${MaximoDeImagens} imagens mais recentes","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":${MaximoDeImagens}},"action":{"type":"expire"}}]}
+
+  RepoRecursos:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${Prefixo}-recursos"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {"rules":[{"rulePriority":1,"description":"manter as ${MaximoDeImagens} imagens mais recentes","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":${MaximoDeImagens}},"action":{"type":"expire"}}]}
+
+  RepoReservas:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${Prefixo}-reservas"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {"rules":[{"rulePriority":1,"description":"manter as ${MaximoDeImagens} imagens mais recentes","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":${MaximoDeImagens}},"action":{"type":"expire"}}]}
+
+  RepoNotificacoes:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${Prefixo}-notificacoes"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {"rules":[{"rulePriority":1,"description":"manter as ${MaximoDeImagens} imagens mais recentes","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":${MaximoDeImagens}},"action":{"type":"expire"}}]}
+
+  RepoMigracao:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${Prefixo}-migracao"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {"rules":[{"rulePriority":1,"description":"manter as ${MaximoDeImagens} imagens mais recentes","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":${MaximoDeImagens}},"action":{"type":"expire"}}]}
+
+Outputs:
+  Registro:
+    Description: Endereco do registro (use no docker login e nas tags)
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com"
+  UriWeb:
+    Value: !GetAtt RepoWeb.RepositoryUri
+  UriUsuarios:
+    Value: !GetAtt RepoUsuarios.RepositoryUri
+  UriRecursos:
+    Value: !GetAtt RepoRecursos.RepositoryUri
+  UriReservas:
+    Value: !GetAtt RepoReservas.RepositoryUri
+  UriNotificacoes:
+    Value: !GetAtt RepoNotificacoes.RepositoryUri
+  UriMigracao:
+    Value: !GetAtt RepoMigracao.RepositoryUri

@@ -1,0 +1,62 @@
+{% load static %}<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reservas da Faculdade</title>
+  <link rel="stylesheet" href="{% static 'painel/app.css' %}">
+</head>
+<body>
+  <header>
+    <h1>Reservas da Faculdade</h1>
+    <div id="sessao" hidden><span id="quem"></span> <button id="sair" class="sec">Sair</button></div>
+  </header>
+
+  <main>
+    <section id="auth" class="duas-colunas">
+      <form id="form-login" class="cartao">
+        <h2>Entrar</h2>
+        <label>E-mail <input type="email" id="login-email" required autocomplete="username"></label>
+        <label>Senha <input type="password" id="login-senha" required autocomplete="current-password"></label>
+        <button type="submit">Entrar</button>
+      </form>
+      <form id="form-cadastro" class="cartao">
+        <h2>Criar conta</h2>
+        <label>Nome <input type="text" id="cad-nome" required maxlength="120"></label>
+        <label>E-mail <input type="email" id="cad-email" required autocomplete="email"></label>
+        <label>Senha (mínimo 8 caracteres) <input type="password" id="cad-senha" required minlength="8" autocomplete="new-password"></label>
+        <button type="submit">Criar conta</button>
+      </form>
+    </section>
+
+    <section id="app" hidden>
+      <div class="cartao">
+        <h2>Nova reserva</h2>
+        <div class="linha">
+          <label>Recurso <select id="recurso"></select></label>
+          <label>Dia <input type="date" id="dia"></label>
+          <label>Duração <select id="duracao"></select></label>
+        </div>
+        <p class="nota">Escolha a hora de início (vermelho = ocupado):</p>
+        <div id="grade" class="grade"></div>
+        <p id="regras" class="nota"></p>
+        <button id="reservar" disabled>Reservar</button>
+      </div>
+
+      <div class="cartao">
+        <h2>Minhas reservas</h2>
+        <table id="minhas">
+          <thead><tr><th>Recurso</th><th>Dia</th><th>Horário</th><th>Status</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <p id="sem-reservas" class="nota" hidden>Nenhuma reserva ainda.</p>
+      </div>
+    </section>
+
+    <p id="mensagem" role="status" hidden></p>
+  </main>
+
+  <footer id="rodape">Nenhuma chamada feita ainda.</footer>
+  <script src="{% static 'painel/app.js' %}"></script>
+</body>
+</html>
